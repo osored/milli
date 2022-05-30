@@ -351,6 +351,56 @@ impl<'a> Filter<'a> {
         let strings_db = index.facet_id_string_docids;
 
         match &self.condition {
+            FilterCondition::In { fid, els } => {
+                // TODO: this could be optimised
+                let filterable_fields = index.filterable_fields(rtxn)?;
+
+                if crate::is_faceted(fid.value(), &filterable_fields) {
+                    let field_ids_map = index.fields_ids_map(rtxn)?;
+
+                    if let Some(fid) = field_ids_map.id(fid.value()) {
+                        let mut bitmap = RoaringBitmap::new();
+
+                        for el in els {
+                            let op = Condition::Equal(el.clone());
+                            let el_bitmap = Self::evaluate_operator(
+                                rtxn, index, numbers_db, strings_db, fid, &op,
+                            )?;
+                            bitmap |= el_bitmap;
+                        }
+                        Ok(bitmap)
+                    } else {
+                        Ok(RoaringBitmap::new())
+                    }
+                } else {
+                    return Err(fid.as_external_error(FilterError::AttributeNotFilterable {
+                        attribute: fid,
+                        filterable_fields,
+                    }))?;
+                }
+            }
+            FilterCondition::NotIn { fid, els } => {
+                let field_ids_map = index.fields_ids_map(rtxn)?;
+                if let Some(fid_integer) = field_ids_map.id(fid.value()) {
+                    let fid = fid.clone();
+                    let els = els.clone();
+                    let in_bitmap =
+                        Self::evaluate(&FilterCondition::In { fid, els }.into(), rtxn, index)?;
+                    let all_ids = index.documents_ids(rtxn)?;
+                    let negated_in = all_ids - in_bitmap;
+                    let exists = {
+                        let exist_number = index.number_faceted_documents_ids(rtxn, fid_integer)?;
+                        let exist_string = index.string_faceted_documents_ids(rtxn, fid_integer)?;
+
+                        exist_string | exist_number
+                    };
+
+                    Ok(negated_in & exists)
+                } else {
+                    // in this case there are no documents in which the field exists, so we return the empty bitmap
+                    return Ok(RoaringBitmap::new());
+                }
+            }
             FilterCondition::Condition { fid, op } => {
                 let filterable_fields = index.filterable_fields(rtxn)?;
 
